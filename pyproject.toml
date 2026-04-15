@@ -1,0 +1,22 @@
+[project]
+name = "ernie-image"
+version = "0.1.0"
+description = "ERNIE-Image local inference (PyTorch + MLX)"
+requires-python = ">=3.12"
+dependencies = [
+    "torch",
+    "diffusers",
+    "transformers",
+    "accelerate",
+    "sentencepiece",
+    "protobuf",
+]
+
+[project.optional-dependencies]
+mlx = [
+    "mlx>=0.22.0",
+    "tokenizers",
+    "safetensors",
+    "Pillow",
+    "numpy",
+]
