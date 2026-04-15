@@ -1,0 +1,37 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Model weights (large)
+models/
+
+# Generated images
+*.png
+
+# Logs
+*.log
+
+# Benchmark scripts (dev only)
+bench_*.py
+verify_*.py
+
+# macOS
+.DS_Store
+
+# Lock file
+uv.lock
+
+# Prompt files (personal)
+p2.txt
+test_ppt_gen.txt
+
+# Other
+ppt_core_summary.png
+.python-version
