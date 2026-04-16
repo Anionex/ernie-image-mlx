@@ -26,7 +26,7 @@ class TransformerConfig:
 @dataclass
 class SchedulerConfig:
     num_train_timesteps: int = 1000
-    shift: float = 3.0
+    shift: float = 3.0  # 3.0 for base, 4.0 for turbo
     use_dynamic_shifting: bool = False
     base_shift: float = 0.5
     max_shift: float = 1.15

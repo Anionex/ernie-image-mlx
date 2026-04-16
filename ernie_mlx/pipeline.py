@@ -32,11 +32,14 @@ class ErnieImagePipeline:
     def __init__(self, model_dir: str):
         """
         Args:
-            model_dir: path to models/PaddlePaddle/ERNIE-Image/
+            model_dir: path to model directory (base or turbo)
         """
         self.model_dir = Path(model_dir)
         self.vae_scale_factor = 16  # 2^4 (4 up blocks in VAE)
         self._loaded = False
+
+        # Auto-detect turbo variant from directory name or config
+        self.is_turbo = "turbo" in self.model_dir.name.lower()
 
         # Load BN stats immediately (tiny)
         vae_weights = mx.load(str(self.model_dir / "vae" / "diffusion_pytorch_model.safetensors"))
@@ -88,19 +91,25 @@ class ErnieImagePipeline:
         self.vae = VAEDecoder()
         load_vae_weights(self.vae, str(self.model_dir / "vae"))
 
-        self.scheduler = FlowMatchEulerScheduler()
+        scheduler_config = SchedulerConfig(shift=4.0 if self.is_turbo else 3.0)
+        self.scheduler = FlowMatchEulerScheduler(scheduler_config)
 
-        # Only compile CFG (B=2) path — it's compute-heavy and benefits from
-        # kernel fusion. Cond (B=1) runs uncompiled at the same speed, and
-        # having a single compiled fn avoids catastrophic GPU cache thrashing
-        # that two compiled fns cause on unified memory (~30s switching cost).
-        def _fwd_cfg(h, t, txt, tl, c):
-            return self.transformer(h, t, txt, tl, c)
-        self._compiled_cfg = mx.compile(_fwd_cfg)
+        if self.is_turbo:
+            # Turbo uses guidance_scale=1.0 (no CFG), so no compiled function needed.
+            self._compiled_cfg = None
+        else:
+            # Only compile CFG (B=2) path — it's compute-heavy and benefits from
+            # kernel fusion. Cond (B=1) runs uncompiled at the same speed, and
+            # having a single compiled fn avoids catastrophic GPU cache thrashing
+            # that two compiled fns cause on unified memory (~30s switching cost).
+            def _fwd_cfg(h, t, txt, tl, c):
+                return self.transformer(h, t, txt, tl, c)
+            self._compiled_cfg = mx.compile(_fwd_cfg)
 
         self._loaded = True
         t1 = time.time()
-        print(f"All models loaded in {t1-t0:.1f}s (dtype={dtype})")
+        variant = "turbo" if self.is_turbo else "base"
+        print(f"All models loaded in {t1-t0:.1f}s (dtype={dtype}, variant={variant})")
 
     def _ensure_text_encoder(self):
         """Reload text encoder if it was freed after a previous generation."""
@@ -172,8 +181,8 @@ class ErnieImagePipeline:
         negative_prompt: str = "",
         height: int = 768,
         width: int = 432,
-        num_inference_steps: int = 20,
-        guidance_scale: float = 5.0,
+        num_inference_steps: int = None,
+        guidance_scale: float = None,
         cfg_cutoff: float = 1.0,
         seed: Optional[int] = None,
     ) -> Image.Image:
@@ -184,8 +193,8 @@ class ErnieImagePipeline:
             negative_prompt: negative text description
             height: output image height (must be divisible by 16)
             width: output image width (must be divisible by 16)
-            num_inference_steps: number of denoising steps
-            guidance_scale: CFG scale (1.0 = no guidance)
+            num_inference_steps: number of denoising steps (default: 8 for turbo, 20 for base)
+            guidance_scale: CFG scale (default: 1.0 for turbo, 5.0 for base)
             cfg_cutoff: fraction of steps to use CFG (0.0-1.0). E.g. 0.5 means
                        first 50% of steps use full CFG (B=2), rest use B=1.
                        Early steps decide structure; late steps refine details.
@@ -194,6 +203,12 @@ class ErnieImagePipeline:
             PIL Image
         """
         self.load()
+
+        # Apply model-appropriate defaults
+        if num_inference_steps is None:
+            num_inference_steps = 8 if self.is_turbo else 20
+        if guidance_scale is None:
+            guidance_scale = 1.0 if self.is_turbo else 5.0
 
         if height % self.vae_scale_factor != 0 or width % self.vae_scale_factor != 0:
             raise ValueError(f"Height and width must be divisible by {self.vae_scale_factor}")

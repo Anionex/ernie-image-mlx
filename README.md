@@ -20,7 +20,19 @@ Benchmarked on Mac M5 Pro (48GB), float32, no quantization:
 
 > MLX dynamically frees the text encoder (~7GB) after encoding, keeping denoising memory well within 48GB. PyTorch MPS holds all models simultaneously.
 
-### Detailed benchmarks
+### Turbo model
+
+ERNIE-Image-Turbo is a distilled version — same 8B DiT architecture, 8 steps, no CFG needed.
+
+| | Base (50 steps, cfg_cutoff=0.5) | Turbo (8 steps, no CFG) |
+|---|---|---|
+| **Total time** (1024x1024) | ~475s | **59.6s** |
+| **Per-step** (1024x1024) | 9.5s/step | 7.15s/step |
+| **End-to-end speedup** | baseline | **~8x faster** |
+
+> PyTorch MPS cannot run Turbo on 48GB Mac — loading all models simultaneously (text encoder + transformer + VAE + prompt enhancer) causes 27GB swap. MLX avoids this by freeing the text encoder after encoding.
+
+### Detailed benchmarks (Base model)
 
 **With CFG cutoff (recommended)**
 
@@ -48,7 +60,9 @@ Benchmarked on Mac M5 Pro (48GB), float32, no quantization:
 
 - macOS with Apple Silicon (M1/M2/M3/M4/M5)
 - Python 3.12+
-- [ERNIE-Image model weights](https://huggingface.co/PaddlePaddle/ERNIE-Image) downloaded to `models/PaddlePaddle/ERNIE-Image/`
+- Model weights downloaded locally:
+  - [ERNIE-Image](https://huggingface.co/baidu/ERNIE-Image) (base, 50 steps) — or —
+  - [ERNIE-Image-Turbo](https://huggingface.co/baidu/ERNIE-Image-Turbo) (distilled, 8 steps)
 
 ### Install
 
@@ -59,27 +73,28 @@ pip install -e ".[mlx]"
 ### Generate
 
 ```bash
-# Basic generation
+# Base model (50 steps, CFG guidance)
 python -m ernie_mlx.generate \
   --prompt "a serene mountain landscape at sunset" \
   --height 1024 --width 1024 \
   --steps 50 --guidance-scale 4.0 \
   --seed 42 --output output.png
 
-# Faster with CFG cutoff (first 50% steps use CFG, rest conditional-only)
+# Base model with CFG cutoff (first 50% steps use CFG, rest conditional-only)
 python -m ernie_mlx.generate \
   --prompt "a cat sitting on a windowsill" \
   --steps 50 --cfg-cutoff 0.5
+
+# Turbo model (8 steps, no CFG — much faster)
+python -m ernie_mlx.generate \
+  --model-dir models/baidu/ERNIE-Image-Turbo \
+  --prompt "a cat sitting on a windowsill" \
+  --height 1024 --width 1024
 
 # Read prompt from file
 python -m ernie_mlx.generate \
   --prompt-file prompt.txt \
   --height 768 --width 432
-
-# No CFG (fastest, but lower prompt adherence)
-python -m ernie_mlx.generate \
-  --prompt "a landscape" \
-  --guidance-scale 1.0 --steps 20
 ```
 
 ### Python API
@@ -87,7 +102,8 @@ python -m ernie_mlx.generate \
 ```python
 from ernie_mlx import ErnieImagePipeline
 
-pipe = ErnieImagePipeline("models/PaddlePaddle/ERNIE-Image")
+# Base model
+pipe = ErnieImagePipeline("models/baidu/ERNIE-Image")
 pipe.load()
 
 image = pipe(
@@ -100,6 +116,18 @@ image = pipe(
     seed=42,
 )
 image.save("output.png")
+
+# Turbo model — auto-detects defaults (8 steps, no CFG)
+pipe = ErnieImagePipeline("models/baidu/ERNIE-Image-Turbo")
+pipe.load()
+
+image = pipe(
+    prompt="a beautiful sunset over the ocean",
+    height=1024,
+    width=1024,
+    seed=42,
+)
+image.save("output_turbo.png")
 ```
 
 ### Parameters
@@ -107,8 +135,8 @@ image.save("output.png")
 | Parameter | Default | Description |
 |---|---|---|
 | `height` / `width` | 768 / 432 | Output resolution (must be divisible by 16) |
-| `num_inference_steps` | 20 | Denoising steps (50 recommended for best quality) |
-| `guidance_scale` | 5.0 | CFG scale (4.0 matches official default) |
+| `num_inference_steps` | 8 (turbo) / 20 (base) | Denoising steps |
+| `guidance_scale` | 1.0 (turbo) / 5.0 (base) | CFG scale (1.0 = no guidance) |
 | `cfg_cutoff` | 1.0 | Fraction of steps using CFG (0.5 = first 50%) |
 | `seed` | None | Random seed for reproducibility |
 

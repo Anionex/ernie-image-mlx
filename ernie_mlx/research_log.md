@@ -10,6 +10,14 @@
 | Memory (denoising) | ~50GB peak | 27GB | 46% less |
 | Accuracy | baseline | max diff 0.041 | <0.35% relative |
 
+**Turbo model: ~8x faster end-to-end**
+
+| Metric | Base (50 steps) | Turbo (8 steps) |
+|---|---|---|
+| Total time (1024x1024) | ~475s | 59.6s |
+| Per-step | 9.5s/step | 7.15s/step |
+| CFG | guidance_scale=4.0, cfg_cutoff=0.5 | None (guidance_scale=1.0) |
+
 ## Optimization Timeline
 
 ### Phase 1: Core Implementation
@@ -126,12 +134,38 @@ Additional pipeline-level fixes:
 | AdaLN float32 upcasts | no measurable diff | 1.08ms vs 1.00ms per block, removed |
 | Single eval per step (skip eval pred) | 14-16s vs 11s CFG (much slower) | Compiled fn output must be eval'd before slicing for CFG math |
 
+### Phase 7: Turbo Model Support
+
+**ERNIE-Image-Turbo** — distilled model, same 8B DiT architecture (36 layers, 4096 dim), different weights.
+
+Key differences from base:
+- **8 steps** (vs 50 for base)
+- **guidance_scale=1.0** (no CFG needed, always B=1)
+- **Scheduler shift=4.0** (vs 3.0 for base)
+
+Implementation: pipeline auto-detects via directory name (`"turbo" in model_dir.name.lower()`), sets defaults accordingly. Skips CFG compilation for Turbo since B is always 1.
+
+**Turbo benchmarks (MLX, 1024x1024):**
+- 8 steps × 7.15s/step = 57.2s denoising
+- Total: 59.6s (including text encoding + VAE decode)
+- vs Base (50 steps, cfg_cutoff=0.5): ~475s → **~8x faster end-to-end**
+
+**PyTorch MPS Turbo failure:**
+PyTorch diffusers cannot run Turbo on 48GB Mac. It loads all models simultaneously (text encoder 7.7GB + transformer 16GB + VAE 0.2GB + prompt enhancer ~3GB) without freeing any. Observed 27GB swap on a 48GB system — unusable. MLX avoids this entirely by freeing the text encoder after encoding.
+
 ## Key Insight
 
-The original hypothesis — that MLX would speed up inference by eliminating Python→Metal dispatch overhead — was partially wrong. Both PyTorch MPS and MLX achieve ~25% GPU ALU utilization. The bottleneck is raw compute throughput (21 TFLOPS needed per step, M5 Pro peak 25 TFLOPS), not dispatch.
+The original hypothesis — that MLX would speed up inference by eliminating Python→Metal dispatch overhead — was partially wrong. Both PyTorch MPS and MLX achieve ~25% GPU ALU utilization, but this is NOT because the GPU is compute-saturated.
+
+**The 25% ALU is a mixed bottleneck:**
+- **Matmul ops** (~45% of step time): Compute-bound (arithmetic intensity ~1241 FLOP/byte, far exceeding the GPU's ops:byte ratio). But ALU utilization during matmul is only ~37% — the theoretical peak isn't fully realized due to warp scheduling, memory latency, and kernel overhead.
+- **Non-matmul ops** (~35% of step time): Memory-bound (norm, RoPE, activations — low arithmetic intensity, limited by bandwidth).
+- **Kernel dispatch gaps** (~20% of step time): Pure idle time between Metal kernel launches.
+
+The 25% overall ALU is the weighted average of ~37% during matmul, ~0% during non-matmul, and 0% during idle gaps — not a single bottleneck mode.
 
 The actual speedup comes from:
-1. **Operator fusion** (QKV, FFN, mx.compile) — reduces total ops
+1. **Operator fusion** (QKV, FFN, mx.compile) — reduces total ops and kernel launches
 2. **CFG cutoff** — halves compute for late steps
 3. **Eliminating GPU cache thrashing** — the single biggest win, not from compute but from memory management
 

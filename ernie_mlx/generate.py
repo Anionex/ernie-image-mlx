@@ -12,14 +12,16 @@ def main():
     parser.add_argument("--negative-prompt", type=str, default="", help="Negative prompt")
     parser.add_argument("--height", type=int, default=768, help="Image height")
     parser.add_argument("--width", type=int, default=432, help="Image width")
-    parser.add_argument("--steps", type=int, default=20, help="Number of inference steps")
-    parser.add_argument("--guidance-scale", type=float, default=5.0, help="CFG guidance scale")
+    parser.add_argument("--steps", type=int, default=None,
+                        help="Number of inference steps (default: 8 for turbo, 20 for base)")
+    parser.add_argument("--guidance-scale", type=float, default=None,
+                        help="CFG guidance scale (default: 1.0 for turbo, 5.0 for base)")
     parser.add_argument("--cfg-cutoff", type=float, default=1.0,
                         help="Fraction of steps using CFG (0.0-1.0). E.g. 0.5 = first 50%% uses CFG")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
     parser.add_argument("--model-dir", type=str,
                         default="models/PaddlePaddle/ERNIE-Image",
-                        help="Path to model directory")
+                        help="Path to model directory (base or turbo)")
     parser.add_argument("--output", type=str, default=None, help="Output file path")
     parser.add_argument("--quantize", type=int, default=0, choices=[0, 4, 8],
                         help="Quantize transformer: 0=none, 4=INT4, 8=INT8")
