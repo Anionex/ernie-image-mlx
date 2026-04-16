@@ -41,18 +41,15 @@ class DiTBlock(nn.Module):
         # Self-attention branch
         residual = x
         x_norm = self.adaLN_sa_ln(x)
-        # AdaLN modulation in float32
-        x_mod = (x_norm.astype(mx.float32) * (1 + scale_msa.astype(mx.float32)) + shift_msa.astype(mx.float32))
-        x_mod = x_mod.astype(x.dtype)
+        x_mod = x_norm * (1 + scale_msa) + shift_msa
         attn_out = self.self_attention(x_mod, mask=attention_mask, rotary_pos_emb=rotary_pos_emb)
-        x = residual + (gate_msa.astype(mx.float32) * attn_out.astype(mx.float32)).astype(x.dtype)
+        x = residual + gate_msa * attn_out
 
         # FFN branch
         residual = x
         x_norm = self.adaLN_mlp_ln(x)
-        x_mod = (x_norm.astype(mx.float32) * (1 + scale_mlp.astype(mx.float32)) + shift_mlp.astype(mx.float32))
-        x_mod = x_mod.astype(x.dtype)
+        x_mod = x_norm * (1 + scale_mlp) + shift_mlp
         ffn_out = self.mlp(x_mod)
-        x = residual + (gate_mlp.astype(mx.float32) * ffn_out.astype(mx.float32)).astype(x.dtype)
+        x = residual + gate_mlp * ffn_out
 
         return x

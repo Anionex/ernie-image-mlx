@@ -1,4 +1,5 @@
 """ERNIE-Image MLX inference pipeline."""
+import gc
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -75,7 +76,7 @@ class ErnieImagePipeline:
         self.transformer = ErnieImageTransformer()
         load_transformer_weights(self.transformer, str(self.model_dir / "transformer"))
 
-        # Fuse projections first (before quantization, which changes weight layout)
+        # Fuse projections for faster matmul
         self.transformer.fuse_qkv_weights()
         self.transformer.fuse_ffn_weights()
 
@@ -89,19 +90,23 @@ class ErnieImagePipeline:
 
         self.scheduler = FlowMatchEulerScheduler()
 
-        # Two compiled entry points — one for B=2 (CFG) and one for B=1
-        # (cond-only). mx.compile traces by input shapes; alternating B=1/B=2
-        # on the same compiled fn forces retrace every step.
+        # Only compile CFG (B=2) path — it's compute-heavy and benefits from
+        # kernel fusion. Cond (B=1) runs uncompiled at the same speed, and
+        # having a single compiled fn avoids catastrophic GPU cache thrashing
+        # that two compiled fns cause on unified memory (~30s switching cost).
         def _fwd_cfg(h, t, txt, tl, c):
             return self.transformer(h, t, txt, tl, c)
-        def _fwd_cond(h, t, txt, tl, c):
-            return self.transformer(h, t, txt, tl, c)
         self._compiled_cfg = mx.compile(_fwd_cfg)
-        self._compiled_cond = mx.compile(_fwd_cond)
 
         self._loaded = True
         t1 = time.time()
         print(f"All models loaded in {t1-t0:.1f}s (dtype={dtype})")
+
+    def _ensure_text_encoder(self):
+        """Reload text encoder if it was freed after a previous generation."""
+        if self.text_encoder is None:
+            self.text_encoder = MistralTextEncoder()
+            load_text_encoder_weights(self.text_encoder, str(self.model_dir / "text_encoder"))
 
     def encode_prompt(self, prompt: str) -> mx.array:
         """Encode a text prompt to hidden states.
@@ -109,6 +114,7 @@ class ErnieImagePipeline:
         Returns:
             [T, hidden_size] text embeddings from second-to-last layer
         """
+        self._ensure_text_encoder()
         input_ids = self.tokenizer.encode(prompt)
         if len(input_ids) == 0:
             input_ids = [1]  # BOS fallback
@@ -213,6 +219,13 @@ class ErnieImagePipeline:
         text_bth_cond, text_lens_cond = self._pad_text(text_hiddens_cond)
         text_bth_cond = text_bth_cond.astype(self._dtype)
 
+        # Free text encoder (~7GB) — no longer needed after encoding.
+        # Note: do NOT call mx.clear_cache() here — it would invalidate
+        # compiled function GPU kernel caches and force expensive retraces.
+        del self.text_encoder
+        self.text_encoder = None
+        gc.collect()
+
         t_encode = time.time()
         print(f"Text encoding: {t_encode - t_start:.2f}s")
 
@@ -226,6 +239,7 @@ class ErnieImagePipeline:
 
         B = 1
         latents = mx.random.normal((B, latent_h, latent_w, latent_channels)).astype(self._dtype)
+        mx.eval(latents)  # materialize before compiled function sees it
 
         # 3. Setup scheduler
         self.scheduler.set_timesteps(num_inference_steps)
@@ -234,16 +248,17 @@ class ErnieImagePipeline:
         H_img = latent_h
         W_img = latent_w
 
-        # Full CFG cache (B=2) — only needed if cfg_steps > 0
+        # Precompute cached inputs for both paths
         if cfg_steps > 0:
             cached_cfg = self.transformer.prepare_inputs(2, H_img, W_img, text_bth_cfg, text_lens_cfg)
-            mx.eval(cached_cfg['rotary_pos_emb'], cached_cfg['text_projected'])
+            cos_cfg, sin_cfg = cached_cfg['rotary_pos_emb']
+            mx.eval(cos_cfg, sin_cfg, cached_cfg['text_projected'])
             if cached_cfg['attention_mask'] is not None:
                 mx.eval(cached_cfg['attention_mask'])
 
-        # Cond-only cache (B=1) for post-cutoff steps
         cached_cond = self.transformer.prepare_inputs(1, H_img, W_img, text_bth_cond, text_lens_cond)
-        mx.eval(cached_cond['rotary_pos_emb'], cached_cond['text_projected'])
+        cos_cond, sin_cond = cached_cond['rotary_pos_emb']
+        mx.eval(cos_cond, sin_cond, cached_cond['text_projected'])
         if cached_cond['attention_mask'] is not None:
             mx.eval(cached_cond['attention_mask'])
 
@@ -251,6 +266,7 @@ class ErnieImagePipeline:
         cfg_mode = f"cutoff={cfg_cutoff} ({cfg_steps}/{num_inference_steps} steps)" if cfg_steps < num_inference_steps else "full"
         print(f"Denoising {num_inference_steps} steps @ {width}x{height} (CFG {cfg_mode})...")
 
+        cfg_freed = False
         for i in range(num_inference_steps):
             t = self.scheduler.timesteps[i:i+1]
             step_start = time.time()
@@ -265,8 +281,14 @@ class ErnieImagePipeline:
                 pred = pred_uncond + guidance_scale * (pred_cond - pred_uncond)
                 step_label = "CFG"
             else:
-                # Late steps: cond-only (B=1) — refine details
-                pred = self._compiled_cond(latents, t, text_bth_cond, text_lens_cond, cached_cond)
+                # Free CFG inputs on first cond-only step
+                if not cfg_freed and cfg_steps > 0:
+                    del cached_cfg, text_bth_cfg, text_lens_cfg
+                    cfg_freed = True
+                # Late steps: cond-only (B=1) — use uncompiled model directly.
+                # B=1 is equally fast uncompiled, and avoids GPU cache thrashing
+                # from switching between two compiled functions.
+                pred = self.transformer(latents, t, text_bth_cond, text_lens_cond, cached_cond)
                 step_label = "cond"
 
             # Scheduler step
@@ -282,14 +304,14 @@ class ErnieImagePipeline:
         total_denoise = t_denoise - t_encode
         print(f"Denoising complete: {total_denoise:.1f}s ({total_denoise/num_inference_steps:.2f}s/step)")
 
-        # 5. BN denormalize (in patchified space, 128 channels)
+        # 7. BN denormalize (in patchified space, 128 channels)
         bn_std = mx.sqrt(self.bn_var + 1e-5)
         latents = latents * bn_std + self.bn_mean
 
-        # 6. Unpatchify: [B, H/16, W/16, 128] → [B, H/8, W/8, 32]
+        # 8. Unpatchify: [B, H/16, W/16, 128] → [B, H/8, W/8, 32]
         latents = self._unpatchify(latents)
 
-        # 7. VAE decode
+        # 9. VAE decode
         print("VAE decoding...")
         t_vae_start = time.time()
         images = self.vae(latents)
@@ -297,7 +319,7 @@ class ErnieImagePipeline:
         t_vae = time.time() - t_vae_start
         print(f"VAE decode: {t_vae:.2f}s")
 
-        # 8. Convert to PIL
+        # 10. Convert to PIL
         img_np = np.array(images[0])  # [H, W, 3] in [0, 1]
         img_np = (img_np * 255).clip(0, 255).astype(np.uint8)
 

@@ -46,7 +46,7 @@ class Attention(nn.Module):
         self._qkv_fused.load_weights([("weight", fused_weight)])
 
     def __call__(self, x: mx.array, mask: mx.array = None,
-                 rotary_pos_emb: mx.array = None) -> mx.array:
+                 rotary_pos_emb: tuple = None) -> mx.array:
         B, S, _ = x.shape
 
         if self._qkv_fused is not None:

@@ -4,7 +4,7 @@ import mlx.nn as nn
 
 from ..config import TransformerConfig
 from .dit_block import DiTBlock
-from .embeddings import PatchEmbed, TimestepEmbedding, rope_3d, timestep_sinusoidal
+from .embeddings import PatchEmbed, TimestepEmbedding, rope_3d, timestep_sinusoidal, precompute_rope_cos_sin
 
 
 class AdaLNContinuous(nn.Module):
@@ -135,9 +135,12 @@ class ErnieImageTransformer(nn.Module):
             attention_mask = mx.concatenate([img_mask, valid_text], axis=1)
             attention_mask = attention_mask.reshape(B, 1, 1, S)
 
+        # Precompute cos/sin (saves 72 trig computations per step: 2×36 layers)
+        rope_cos_sin = precompute_rope_cos_sin(rotary_pos_emb)
+
         return {
             'text_projected': text_bth,
-            'rotary_pos_emb': rotary_pos_emb,
+            'rotary_pos_emb': rope_cos_sin,
             'attention_mask': attention_mask,
             'N_img': N_img,
         }

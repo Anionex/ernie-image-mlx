@@ -46,21 +46,33 @@ def rope_3d(ids: mx.array, axes_dim: tuple, theta: int) -> mx.array:
     return emb
 
 
-def apply_rotary_emb(x: mx.array, freqs: mx.array) -> mx.array:
+def precompute_rope_cos_sin(freqs: mx.array):
+    """Precompute cos/sin from RoPE frequencies (called once in prepare_inputs).
+
+    Args:
+        freqs: [B, S, 1, head_dim] angle frequencies
+    Returns:
+        (cos, sin) each [B, S, 1, head_dim]
+    """
+    return mx.cos(freqs), mx.sin(freqs)
+
+
+def apply_rotary_emb(x: mx.array, cos_sin: tuple) -> mx.array:
     """Apply rotary position embedding (non-interleaved).
 
     Args:
         x: [B, S, heads, head_dim]
-        freqs: [B, S, 1, head_dim] angle frequencies
+        cos_sin: tuple of (cos, sin) each [B, S, 1, head_dim], precomputed
     Returns:
         [B, S, heads, head_dim]
     """
-    rot_dim = freqs.shape[-1]
+    cos_, sin_ = cos_sin
+    rot_dim = cos_.shape[-1]
     x_rot = x[..., :rot_dim]
     x_pass = x[..., rot_dim:]
 
-    cos_ = mx.cos(freqs).astype(x.dtype)
-    sin_ = mx.sin(freqs).astype(x.dtype)
+    cos_ = cos_.astype(x.dtype)
+    sin_ = sin_.astype(x.dtype)
 
     # Non-interleaved rotate_half: [-x2, x1]
     half = rot_dim // 2
